@@ -1,6 +1,6 @@
 const PREFIX = 'video-shelf-' + encodeURIComponent(self.registration.scope) + '-';
-const CACHE = PREFIX + '20261007-1';
-const files = ['index.html','app.js','install.js','manifest.webmanifest','icons/icon-192.png','icons/icon-512.png'];
+const CACHE = PREFIX + '20261007-drive-1';
+const files = ['index.html','app.js','install.js','drive.js','manifest.webmanifest','icons/icon-192.png','icons/icon-512.png'];
 const url = name => new URL(name, self.registration.scope).href;
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(files.map(url))));
