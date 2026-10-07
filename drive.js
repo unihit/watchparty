@@ -186,17 +186,19 @@
       await imageStore('put', id, { blob, dirty: true, changedAt: crypto.randomUUID(), remoteId: null });
     },
     async showThumbnail(video, image) {
-      try {
-        let cached = await imageStore('get', video.id);
-        if (video.thumbnailFileId && token && (!cached || (!cached.dirty && cached.remoteId !== video.thumbnailFileId))) {
-          const blob = await (await api('files/' + encodeURIComponent(video.thumbnailFileId) + '?alt=media')).blob();
-          if (blob.type.startsWith('image/')) { cached = { blob, dirty: false, remoteId: video.thumbnailFileId }; await imageStore('put', video.id, cached); }
-        }
-        if (cached?.blob && image.isConnected) {
-          const url = URL.createObjectURL(cached.blob); objectUrls.add(url);
-          image.onerror = () => { image.hidden = true; }; image.hidden = false; image.src = url;
-        }
-      } catch { /* Keep the YouTube thumbnail if a saved thumbnail cannot be read. */ }
+      const display = blob => {
+        if (!blob || !image.isConnected) return;
+        const url=URL.createObjectURL(blob);objectUrls.add(url);
+        image.onload=()=>{image.hidden=false};image.onerror=()=>{image.hidden=true};
+        image.hidden=false;image.src=url;
+      };
+      let cached;
+      try { cached=await imageStore('get',video.id); } catch {}
+      if(cached?.blob)display(cached.blob);
+      if(video.thumbnailFileId&&token&&(!cached||(!cached.dirty&&cached.remoteId!==video.thumbnailFileId))){
+        try{const response=await api('files/'+encodeURIComponent(video.thumbnailFileId)+'?alt=media');let blob=await response.blob();if(!blob.type.startsWith('image/'))blob=new Blob([blob],{type:'image/jpeg'});display(blob);try{await imageStore('put',video.id,{blob,dirty:false,remoteId:video.thumbnailFileId})}catch{}}
+        catch { /* A local thumbnail stays visible if Drive is unavailable. */ }
+      }
     }
   };
   controls(); app.render();
