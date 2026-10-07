@@ -1,14 +1,13 @@
 (() => {
   const $ = id => document.getElementById(id), app = window.Watchparty;
   const SCOPE = 'https://www.googleapis.com/auth/drive.file';
-  let token = null, expiry = 0, folder = null, thumbnailFolder = null, jsonFile = null, baseline = null, busy = false, dirty = false, timer, dbPromise;
+  let token = null, expiry = 0, folder = null, thumbnailFolder = null, jsonFile = null, baseline = null, busy = false, dirty = false, autoPaused = false, timer, dbPromise;
   const objectUrls = new Set();
   const status = text => $('driveStatus').textContent = text;
   const controls = () => {
     $('driveConnect').disabled = busy;
     $('driveLoad').disabled = !token || busy || !jsonFile;
     $('driveSave').disabled = !token || busy;
-    $('driveAuto').disabled = !token || busy || Boolean(jsonFile && !baseline);
     $('driveDisconnect').hidden = !token;
     $('driveFolderLink').hidden = !folder;
     if(folder) $('driveFolderLink').href = 'https://drive.google.com/drive/folders/' + folder;
@@ -53,7 +52,19 @@
     if (folder) {
       const files = await json(query("trashed = false and '" + folder + "' in parents and appProperties has { key='watchparty' and value='catalog-v1' }"));
       jsonFile = files.files[0] || null;
+      if(jsonFile) {
+        const before = await metadata(jsonFile.id);
+        const remote = await (await api('files/' + encodeURIComponent(jsonFile.id) + '?alt=media')).json();
+        const after = await metadata(jsonFile.id);
+        if(before.version === after.version && fingerprint(remote) === fingerprint(app.getState())) baseline = after.version;
+      }
     }
+  }
+  function fingerprint(state) {
+    if(state?.version !== 2 || !catalogValid(state.categories,state.presets) || !Array.isArray(state.videos) || !state.videos.every(valid)) return null;
+    const normalized = {...state,streamers:state.streamers || [],videos:state.videos.map(v=>({...v,category:v.category || 'unclassified',work:v.work || '',streamer:v.streamer || ''}))};
+    const sort = value => Array.isArray(value) ? value.map(sort) : value && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map(key=>[key,sort(value[key])])) : value;
+    return JSON.stringify(sort(normalized));
   }
   async function multipart(metadata, blob) {
     const boundary = 'watchparty_' + crypto.randomUUID();
@@ -66,7 +77,9 @@
   async function ensureThumbnailFolder() {
     if (!thumbnailFolder) {
       const found = await json(query("trashed = false and '" + folder + "' in parents and mimeType = 'application/vnd.google-apps.folder' and appProperties has { key='watchparty' and value='thumbnail-folder-v1' }"));
-      thumbnailFolder = found.files[0]?.id || (await json('files?fields=id', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: '썸네일', parents: [folder], mimeType: 'application/vnd.google-apps.folder', appProperties: { watchparty: 'thumbnail-folder-v1' } }) })).id;
+      const existing = found.files[0];
+      thumbnailFolder = existing?.id || (await json('files?fields=id', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'thumbnail', parents: [folder], mimeType: 'application/vnd.google-apps.folder', appProperties: { watchparty: 'thumbnail-folder-v1' } }) })).id;
+      if(existing && existing.name !== 'thumbnail') await json('files/' + encodeURIComponent(existing.id) + '?fields=id', {method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:'thumbnail'})});
     }
     // Move only thumbnails previously created by this app in its own root folder.
     let page;
@@ -81,7 +94,7 @@
   async function checkConflict() {
     if (jsonFile) {
       const latest = await metadata(jsonFile.id);
-      if (!baseline || latest.version !== baseline) { $('driveAuto').checked = false; throw Error('Drive에 다른 변경 내용이 있습니다. 먼저 불러오세요. 현재 기기 목록은 내보내기로 보관할 수 있습니다.'); }
+      if (!baseline || latest.version !== baseline) { autoPaused = true; throw Error('Drive에 다른 변경 내용이 있어 자동 저장을 멈췄습니다. 먼저 불러오세요. 현재 기기 목록은 내보내기로 보관할 수 있습니다.'); }
     }
   }
   async function uploadState() {
@@ -112,13 +125,14 @@
     if (busy) return;
     busy = true; controls();
     try { await operation(); } catch (error) { status(error.message || '연결에 실패했습니다.'); }
-    finally { busy = false; controls(); if (dirty && token && $('driveAuto').checked) schedule(); }
+    finally { busy = false; controls(); if (canAutoSave()) schedule(); }
   }
   async function saveRemote() {
     await run(async () => {
+      clearTimeout(timer); autoPaused = false;
       status('목록과 썸네일을 Drive에 저장 중…'); dirty = false;
       try { await uploadState(); status('Drive에 저장했습니다. 다른 기기에서 같은 Google 계정으로 불러오세요.'); }
-      catch (error) { dirty = true; $('driveAuto').checked = false; throw error; }
+      catch (error) { dirty = true; autoPaused = true; throw error; }
     });
   }
   async function loadRemote() {
@@ -135,12 +149,14 @@
         const cached = await imageStore('get', video.id);
         if (cached && !cached.dirty && (!video.thumbnailFileId || cached.remoteId !== video.thumbnailFileId)) await imageStore('delete', video.id);
       }
-      app.applyState(data); baseline = after.version; dirty = false;
-      status('Drive 목록을 불러왔습니다. 편집 후 자동 저장을 켤 수 있습니다.');
+      app.applyState(data); baseline = after.version; dirty = false; autoPaused = false;
+      for(const video of data.videos) if((await imageStore('get',video.id))?.dirty) dirty = true;
+      status('Drive 목록을 불러왔습니다. 편집 내용은 자동 저장됩니다.');
     });
   }
+  const canAutoSave = () => dirty && token && !autoPaused && (!jsonFile || baseline);
   function schedule() {
-    clearTimeout(timer); timer = setTimeout(() => { if (!busy && dirty && token && $('driveAuto').checked) saveRemote(); }, 1500);
+    clearTimeout(timer); timer = setTimeout(() => { if (!busy && canAutoSave()) saveRemote(); }, 1500);
   }
   function loadGIS() {
     if (window.google?.accounts?.oauth2) return Promise.resolve();
@@ -163,10 +179,10 @@
       callback: async result => {
         if (result.error || !result.access_token) { status('Google 연결을 승인하지 않았습니다.'); return; }
         token = result.access_token; expiry = Date.now() + Number(result.expires_in || 3600) * 1000 - 30000;
-        $('driveAuto').checked = false;
+        autoPaused = false;
         await run(async () => {
           status('watchparty 저장 파일을 찾는 중…'); await discover();
-          status(jsonFile ? '저장된 Drive 목록이 있습니다. 불러오기를 눌러주세요.' : '연결됐습니다. Drive에 저장을 누르면 watchparty 폴더를 만듭니다.');
+          status(jsonFile && !baseline ? 'Drive 목록과 현재 기기 목록이 다릅니다. 불러오기 후 편집하면 자동 저장됩니다.' : 'watchparty에 연결됐습니다. 편집 내용은 자동 저장됩니다.');
           app.render();
         });
       }
@@ -179,13 +195,12 @@
     event.preventDefault(); const id = $('clientId').value.trim();
     if (!/^[A-Za-z0-9_-]+\.apps\.googleusercontent\.com$/.test(id)) { $('driveConfigError').textContent = '올바른 웹 OAuth 클라이언트 ID를 입력해주세요.'; return; }
     try { localStorage.setItem('watchparty-google-client-id', id); } catch { $('driveConfigError').textContent = '이 브라우저에서 설정을 저장할 수 없습니다.'; return; }
-    token = null; folder = null; thumbnailFolder = null; jsonFile = null; baseline = null; $('driveAuto').checked = false; controls();
+    clearTimeout(timer); token = null; folder = null; thumbnailFolder = null; jsonFile = null; baseline = null; autoPaused = false; controls();
     $('driveConfig').close(); status('설정을 저장했습니다. Google 연결을 눌러주세요.');
   };
   $('driveConnect').onclick = connect; $('driveSave').onclick = saveRemote; $('driveLoad').onclick = loadRemote;
-  $('driveAuto').onchange = () => { if ($('driveAuto').checked && dirty) schedule(); };
   $('driveDisconnect').onclick = () => {
-    clearTimeout(timer); token = null; expiry = 0; folder = null; thumbnailFolder = null; jsonFile = null; baseline = null; $('driveAuto').checked = false; controls();
+    clearTimeout(timer); token = null; expiry = 0; folder = null; thumbnailFolder = null; jsonFile = null; baseline = null; autoPaused = false; controls();
     status('연결을 해제했습니다. 기기에 저장한 목록과 썸네일은 유지됩니다.');
   };
   window.WatchpartyDrive = {
@@ -196,7 +211,7 @@
       await saveRemote(); return !dirty;
     },
     releaseThumbnails() { for (const url of objectUrls) URL.revokeObjectURL(url); objectUrls.clear(); },
-    changed() { dirty = true; if (token && $('driveAuto').checked) schedule(); },
+    changed() { dirty = true; if (canAutoSave()) {status('편집 내용을 자동 저장할 예정입니다…');schedule();} else if(!token) status('이 기기에 저장했습니다. Google 연결 후 Drive에 저장하면 다른 기기에서도 볼 수 있습니다.'); },
     async storeThumbnail(id, file) {
       if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type) || file.size > 10 * 1024 * 1024) throw Error('10MB 이하의 JPG, PNG, WebP 이미지를 선택하세요.');
       const bitmap = await createImageBitmap(file), canvas = document.createElement('canvas');

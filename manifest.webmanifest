@@ -1,7 +1,7 @@
 {
   "id": "./",
-  "name": "Watchparty · 내 영상 보관함",
-  "short_name": "Watchparty",
+  "name": "watchparty",
+  "short_name": "watchparty",
   "description": "썸네일과 카테고리로 정리하는 개인 영상 링크 목록",
   "lang": "ko",
   "start_url": "./",
