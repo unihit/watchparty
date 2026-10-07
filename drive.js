@@ -1,7 +1,7 @@
 (() => {
   const $ = id => document.getElementById(id), app = window.Watchparty;
   const SCOPE = 'https://www.googleapis.com/auth/drive.file';
-  let token = null, expiry = 0, folder = null, jsonFile = null, baseline = null, busy = false, dirty = false, timer, dbPromise;
+  let token = null, expiry = 0, folder = null, thumbnailFolder = null, jsonFile = null, baseline = null, busy = false, dirty = false, timer, dbPromise;
   const objectUrls = new Set();
   const status = text => $('driveStatus').textContent = text;
   const controls = () => {
@@ -10,6 +10,8 @@
     $('driveSave').disabled = !token || busy;
     $('driveAuto').disabled = !token || busy || Boolean(jsonFile && !baseline);
     $('driveDisconnect').hidden = !token;
+    $('driveFolderLink').hidden = !folder;
+    if(folder) $('driveFolderLink').href = 'https://drive.google.com/drive/folders/' + folder;
     $('driveConnect').textContent = token ? '다시 연결' : 'Google 연결';
   };
   const db = () => dbPromise ||= new Promise((resolve, reject) => {
@@ -47,7 +49,7 @@
   const query = q => 'files?' + new URLSearchParams({ q, spaces: 'drive', fields: 'files(id,name,version,modifiedTime),nextPageToken', pageSize: '100' });
   async function discover() {
     const found = await json(query("trashed = false and mimeType = 'application/vnd.google-apps.folder' and appProperties has { key='watchparty' and value='folder-v1' }"));
-    folder = found.files[0]?.id || null; jsonFile = null; baseline = null;
+    folder = found.files[0]?.id || null; thumbnailFolder = null; jsonFile = null; baseline = null;
     if (folder) {
       const files = await json(query("trashed = false and '" + folder + "' in parents and appProperties has { key='watchparty' and value='catalog-v1' }"));
       jsonFile = files.files[0] || null;
@@ -61,6 +63,20 @@
   async function ensureFolder() {
     if (!folder) folder = (await json('files?fields=id', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Watchparty', mimeType: 'application/vnd.google-apps.folder', appProperties: { watchparty: 'folder-v1' } }) })).id;
   }
+  async function ensureThumbnailFolder() {
+    if (!thumbnailFolder) {
+      const found = await json(query("trashed = false and '" + folder + "' in parents and mimeType = 'application/vnd.google-apps.folder' and appProperties has { key='watchparty' and value='thumbnail-folder-v1' }"));
+      thumbnailFolder = found.files[0]?.id || (await json('files?fields=id', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: '썸네일', parents: [folder], mimeType: 'application/vnd.google-apps.folder', appProperties: { watchparty: 'thumbnail-folder-v1' } }) })).id;
+    }
+    // Move only thumbnails previously created by this app in its own root folder.
+    let page;
+    do {
+      const path = query("trashed = false and '" + folder + "' in parents and appProperties has { key='watchparty' and value='thumbnail-v1' }") + (page ? '&pageToken=' + encodeURIComponent(page) : '');
+      const old = await json(path);
+      for (const file of old.files) await json('files/' + encodeURIComponent(file.id) + '?' + new URLSearchParams({ addParents: thumbnailFolder, removeParents: folder, fields: 'id' }), { method: 'PATCH' });
+      page = old.nextPageToken;
+    } while(page);
+  }
   const metadata = id => json('files/' + encodeURIComponent(id) + '?fields=id,version');
   async function checkConflict() {
     if (jsonFile) {
@@ -69,13 +85,13 @@
     }
   }
   async function uploadState() {
-    await checkConflict(); await ensureFolder();
+    await checkConflict(); await ensureFolder(); await ensureThumbnailFolder();
     const snapshot = app.getState();
     const uploaded = [];
     for (const video of snapshot.videos) {
       const cached = await imageStore('get', video.id);
       if (cached?.dirty) {
-        const file = await multipart({ name: video.id + '.jpg', parents: [folder], appProperties: { watchparty: 'thumbnail-v1' } }, cached.blob);
+        const file = await multipart({ name: video.id + '.jpg', parents: [thumbnailFolder], appProperties: { watchparty: 'thumbnail-v1' } }, cached.blob);
         video.thumbnailFileId = file.id; uploaded.push({ id: video.id, fileId: file.id, cached });
       }
     }
@@ -117,7 +133,7 @@
       if (data?.version !== 2 || !catalogValid(data.categories, data.presets) || !Array.isArray(data.videos) || !data.videos.every(valid)) throw Error('올바른 Watchparty 목록이 아닙니다.');
       for (const video of data.videos) {
         const cached = await imageStore('get', video.id);
-        if (cached && (!video.thumbnailFileId || cached.remoteId !== video.thumbnailFileId)) await imageStore('delete', video.id);
+        if (cached && !cached.dirty && (!video.thumbnailFileId || cached.remoteId !== video.thumbnailFileId)) await imageStore('delete', video.id);
       }
       app.applyState(data); baseline = after.version; dirty = false;
       status('Drive 목록을 불러왔습니다. 편집 후 자동 저장을 켤 수 있습니다.');
@@ -163,16 +179,22 @@
     event.preventDefault(); const id = $('clientId').value.trim();
     if (!/^[A-Za-z0-9_-]+\.apps\.googleusercontent\.com$/.test(id)) { $('driveConfigError').textContent = '올바른 웹 OAuth 클라이언트 ID를 입력해주세요.'; return; }
     try { localStorage.setItem('watchparty-google-client-id', id); } catch { $('driveConfigError').textContent = '이 브라우저에서 설정을 저장할 수 없습니다.'; return; }
-    token = null; folder = null; jsonFile = null; baseline = null; $('driveAuto').checked = false; controls();
+    token = null; folder = null; thumbnailFolder = null; jsonFile = null; baseline = null; $('driveAuto').checked = false; controls();
     $('driveConfig').close(); status('설정을 저장했습니다. Google 연결을 눌러주세요.');
   };
   $('driveConnect').onclick = connect; $('driveSave').onclick = saveRemote; $('driveLoad').onclick = loadRemote;
   $('driveAuto').onchange = () => { if ($('driveAuto').checked && dirty) schedule(); };
   $('driveDisconnect').onclick = () => {
-    clearTimeout(timer); token = null; expiry = 0; folder = null; jsonFile = null; baseline = null; $('driveAuto').checked = false; controls();
+    clearTimeout(timer); token = null; expiry = 0; folder = null; thumbnailFolder = null; jsonFile = null; baseline = null; $('driveAuto').checked = false; controls();
     status('연결을 해제했습니다. 기기에 저장한 목록과 썸네일은 유지됩니다.');
   };
   window.WatchpartyDrive = {
+    async uploadAfterEdit() {
+      clearTimeout(timer);
+      if(!token) { status('썸네일은 이 기기에 저장됐습니다. Google 연결 후 Drive에 저장을 눌러 업로드하세요.'); return false; }
+      if(busy) { status('Drive 작업 중입니다. 완료 후 Drive에 저장을 눌러주세요.'); return false; }
+      await saveRemote(); return !dirty;
+    },
     releaseThumbnails() { for (const url of objectUrls) URL.revokeObjectURL(url); objectUrls.clear(); },
     changed() { dirty = true; if (token && $('driveAuto').checked) schedule(); },
     async storeThumbnail(id, file) {
