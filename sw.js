@@ -1,6 +1,6 @@
 const PREFIX = 'video-shelf-' + encodeURIComponent(self.registration.scope) + '-';
-const CACHE = PREFIX + '20261007-streamer-1';
-const files = ['index.html','app.js?v=20261007-streamer-1','install.js?v=20261007-streamer-1','drive.js?v=20261007-streamer-1','manifest.webmanifest','icons/icon-192.png','icons/icon-512.png'];
+const CACHE = PREFIX + '20261007-brand-1';
+const files = ['index.html','app.js?v=20261007-brand-1','install.js?v=20261007-brand-1','drive.js?v=20261007-brand-1','manifest.webmanifest','icons/icon-192.png','icons/icon-512.png'];
 const url = name => new URL(name, self.registration.scope).href;
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(files.map(name => new Request(url(name), { cache: 'reload' })))));

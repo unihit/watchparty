@@ -2,7 +2,7 @@
   "id": "./",
   "name": "watchparty",
   "short_name": "watchparty",
-  "description": "썸네일과 카테고리로 정리하는 개인 영상 링크 목록",
+  "description": "좋아하는 스트리머의 같이보기 영상 링크를 작품별로 모아보세요.",
   "lang": "ko",
   "start_url": "./",
   "scope": "./",
