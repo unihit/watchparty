@@ -4,6 +4,19 @@
   let token = null, expiry = 0, folder = null, thumbnailFolder = null, jsonFile = null, baseline = null, busy = false, dirty = false, autoPaused = false, timer, dbPromise;
   const objectUrls = new Set();
   let gisLoading = false, gisPromise, candidate = null, lastSaved = null;
+  let acceptedFingerprint = null, canAdoptCandidate = false;
+  const SYNC_KEY = 'watchparty-sync-baselines-v1';
+  function storedBaseline() {
+    try { return JSON.parse(localStorage.getItem(SYNC_KEY)||'{}')[jsonFile?.id]?.fingerprint; } catch { return null; }
+  }
+  function rememberBaseline(data) {
+    acceptedFingerprint=fingerprint(data);
+    try {
+      const saved=JSON.parse(localStorage.getItem(SYNC_KEY)||'{}');
+      saved[jsonFile.id]={fingerprint:acceptedFingerprint,version:baseline};
+      localStorage.setItem(SYNC_KEY,JSON.stringify(saved));
+    } catch { /* In-memory conflict protection remains available. */ }
+  }
   const status = text => { $('driveStatus').textContent = text; controls(); };
   const controls = () => {
     const needsChoice = Boolean(token && jsonFile && !baseline && candidate);
@@ -22,11 +35,11 @@
     $('driveFolderLink').hidden = !folder;
     if(folder) $('driveFolderLink').href = 'https://drive.google.com/drive/folders/' + folder;
     $('driveConnect').textContent = gisLoading ? '로그인 준비 중…' : 'Google 계정으로 연결';
-    $('driveTitle').textContent = token ? 'Drive 자동 저장' : '기기 간 동기화';
+    $('driveTitle').textContent = token ? 'Drive 동기화' : '기기 간 동기화';
     $('driveBadge').textContent = busy ? '동기화 중…' : !token ? '이 기기에 보관 중' : needsChoice ? '목록 선택 필요' : autoPaused ? '저장 확인 필요' : dirty ? '저장 대기 중' : '자동 저장 켜짐';
     $('driveBadge').className = 'sync-badge ' + (busy ? 'working' : !token ? 'local' : needsChoice || autoPaused ? 'paused' : dirty ? 'working' : 'saved');
     $('driveLastSaved').hidden = !token || !lastSaved;
-    if(lastSaved) $('driveLastSaved').textContent = '마지막 Drive 저장 · ' + lastSaved.toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'});
+    if(lastSaved) $('driveLastSaved').textContent = '마지막 동기화 · ' + lastSaved.toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'});
   };
   const db = () => dbPromise ||= new Promise((resolve, reject) => {
     const request = indexedDB.open('watchparty-thumbnails', 1);
@@ -63,13 +76,15 @@
   const query = q => 'files?' + new URLSearchParams({ q, spaces: 'drive', fields: 'files(id,name,version,modifiedTime),nextPageToken', pageSize: '100' });
   async function discover() {
     const found = await json(query("trashed = false and mimeType = 'application/vnd.google-apps.folder' and appProperties has { key='watchparty' and value='folder-v1' }"));
-    folder = found.files[0]?.id || null; thumbnailFolder = null; jsonFile = null; baseline = null; candidate = null;
+    folder = found.files[0]?.id || null; thumbnailFolder = null; jsonFile = null; baseline = null; candidate = null; acceptedFingerprint=null; canAdoptCandidate=false;
     if (folder) {
       const files = await json(query("trashed = false and '" + folder + "' in parents and appProperties has { key='watchparty' and value='catalog-v1' }"));
       jsonFile = files.files[0] || null;
       if(jsonFile) {
         candidate = await readRemote();
-        if(fingerprint(candidate.data) === fingerprint(app.getState())) baseline = candidate.version;
+        const localFingerprint=fingerprint(app.getState());
+        if(fingerprint(candidate.data) === localFingerprint) {baseline=candidate.version;rememberBaseline(app.getState());lastSaved=new Date();}
+        else canAdoptCandidate=Boolean(storedBaseline() && storedBaseline()===localFingerprint);
       }
     }
   }
@@ -86,7 +101,8 @@
       const cached = await imageStore('get',video.id);
       if(cached && !cached.dirty && (!video.thumbnailFileId || cached.remoteId !== video.thumbnailFileId)) await imageStore('delete',video.id);
     }
-    app.applyState(data); baseline = version; dirty = false; autoPaused = false;
+    app.applyState(data); baseline = version; dirty = false; autoPaused = false; lastSaved=new Date();
+    rememberBaseline(app.getState());
     for(const video of data.videos) if((await imageStore('get',video.id))?.dirty) dirty = true;
   }
   function mergedCatalog(local,remote) {
@@ -175,6 +191,7 @@
     if (jsonFile) jsonFile = await json('files/' + encodeURIComponent(jsonFile.id) + '?uploadType=media&fields=id,version', { method: 'PATCH', body: blob }, true);
     else jsonFile = await multipart({ name: 'watchparty.json', parents: [folder], appProperties: { watchparty: 'catalog-v1' } }, blob);
     baseline = jsonFile.version;
+    rememberBaseline(snapshot);
     for (const image of uploaded) {
       const latest = await imageStore('get', image.id);
       if (latest?.changedAt === image.cached.changedAt) {
@@ -238,7 +255,7 @@
         autoPaused = false; lastSaved=null;
         await run(async () => {
           status('watchparty 저장 파일을 찾는 중…'); await discover();
-          if(jsonFile && !baseline && !app.getState().videos.length) {
+          if(jsonFile && !baseline && (canAdoptCandidate || (!app.getState().videos.length && !dirty))) {
             await adoptRemote(candidate.data,candidate.version);
             status('Drive 목록을 자동으로 가져왔습니다. 편집 내용은 자동 저장됩니다.');
           } else if(!jsonFile) {
@@ -265,6 +282,28 @@
   $('driveRetry').onclick = saveRemote; $('driveResolve').onclick = chooseLists;
   $('driveMerge').onclick = () => resolveLists(true); $('driveUseRemote').onclick = () => resolveLists(false);
   $('driveChoiceLater').onclick = () => $('driveChoice').close();
+  async function syncLatest() {
+    if(busy || !token || !jsonFile || !baseline || dirty || autoPaused || document.hidden || document.querySelector?.('dialog[open]')) return;
+    await run(async()=>{
+      const latest=await metadata(jsonFile.id);
+      if(latest.version===baseline) return;
+      candidate=await readRemote();
+      if(acceptedFingerprint && fingerprint(app.getState())===acceptedFingerprint) {
+        await adoptRemote(candidate.data,candidate.version);
+        status('다른 기기의 변경 내용을 가져왔습니다. 카테고리와 작품명도 최신 상태입니다.');
+      } else {
+        baseline=null; autoPaused=true;
+        status('이 기기에도 변경 내용이 있습니다. 목록 선택하기에서 합치거나 Drive 목록을 가져오세요.');
+      }
+    });
+    if(candidate && !baseline) chooseLists();
+  }
+  setInterval(syncLatest,30000);
+  window.addEventListener?.('focus',syncLatest);
+  document.addEventListener?.('visibilitychange',()=>{
+    if(document.hidden) {if(canAutoSave() && !busy) saveRemote();}
+    else syncLatest();
+  });
   $('driveDisconnect').onclick = () => {
     clearTimeout(timer); token = null; expiry = 0; folder = null; thumbnailFolder = null; jsonFile = null; baseline = null; autoPaused = false; controls();
     status('연결을 해제했습니다. 기기에 저장한 목록과 썸네일은 유지됩니다.');
