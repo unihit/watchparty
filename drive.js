@@ -3,15 +3,30 @@
   const SCOPE = 'https://www.googleapis.com/auth/drive.file';
   let token = null, expiry = 0, folder = null, thumbnailFolder = null, jsonFile = null, baseline = null, busy = false, dirty = false, autoPaused = false, timer, dbPromise;
   const objectUrls = new Set();
-  const status = text => $('driveStatus').textContent = text;
+  let gisLoading = false, gisPromise, candidate = null, lastSaved = null;
+  const status = text => { $('driveStatus').textContent = text; controls(); };
   const controls = () => {
-    $('driveConnect').disabled = busy;
+    const needsChoice = Boolean(token && jsonFile && !baseline && candidate);
+    $('driveConnect').disabled = busy || gisLoading;
+    $('driveConnect').hidden = Boolean(token);
+    $('driveResolve').hidden = !needsChoice;
+    $('driveResolve').disabled = busy;
+    $('driveRetry').hidden = !token || needsChoice || !autoPaused;
+    $('driveRetry').disabled = busy;
+    $('driveMerge').disabled = busy; $('driveUseRemote').disabled = busy;
     $('driveLoad').disabled = !token || busy || !jsonFile;
     $('driveSave').disabled = !token || busy;
+    $('driveSave').hidden = !token;
+    $('driveLoad').hidden = !token || !jsonFile;
     $('driveDisconnect').hidden = !token;
     $('driveFolderLink').hidden = !folder;
     if(folder) $('driveFolderLink').href = 'https://drive.google.com/drive/folders/' + folder;
-    $('driveConnect').textContent = token ? '다시 연결' : 'Google 연결';
+    $('driveConnect').textContent = gisLoading ? '로그인 준비 중…' : 'Google 계정으로 연결';
+    $('driveTitle').textContent = token ? 'Drive 자동 저장' : '기기 간 동기화';
+    $('driveBadge').textContent = busy ? '동기화 중…' : !token ? '이 기기에 보관 중' : needsChoice ? '목록 선택 필요' : autoPaused ? '저장 확인 필요' : dirty ? '저장 대기 중' : '자동 저장 켜짐';
+    $('driveBadge').className = 'sync-badge ' + (busy ? 'working' : !token ? 'local' : needsChoice || autoPaused ? 'paused' : dirty ? 'working' : 'saved');
+    $('driveLastSaved').hidden = !token || !lastSaved;
+    if(lastSaved) $('driveLastSaved').textContent = '마지막 Drive 저장 · ' + lastSaved.toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'});
   };
   const db = () => dbPromise ||= new Promise((resolve, reject) => {
     const request = indexedDB.open('watchparty-thumbnails', 1);
@@ -48,17 +63,61 @@
   const query = q => 'files?' + new URLSearchParams({ q, spaces: 'drive', fields: 'files(id,name,version,modifiedTime),nextPageToken', pageSize: '100' });
   async function discover() {
     const found = await json(query("trashed = false and mimeType = 'application/vnd.google-apps.folder' and appProperties has { key='watchparty' and value='folder-v1' }"));
-    folder = found.files[0]?.id || null; thumbnailFolder = null; jsonFile = null; baseline = null;
+    folder = found.files[0]?.id || null; thumbnailFolder = null; jsonFile = null; baseline = null; candidate = null;
     if (folder) {
       const files = await json(query("trashed = false and '" + folder + "' in parents and appProperties has { key='watchparty' and value='catalog-v1' }"));
       jsonFile = files.files[0] || null;
       if(jsonFile) {
-        const before = await metadata(jsonFile.id);
-        const remote = await (await api('files/' + encodeURIComponent(jsonFile.id) + '?alt=media')).json();
-        const after = await metadata(jsonFile.id);
-        if(before.version === after.version && fingerprint(remote) === fingerprint(app.getState())) baseline = after.version;
+        candidate = await readRemote();
+        if(fingerprint(candidate.data) === fingerprint(app.getState())) baseline = candidate.version;
       }
     }
+  }
+  async function readRemote() {
+    const before = await metadata(jsonFile.id);
+    const data = await (await api('files/' + encodeURIComponent(jsonFile.id) + '?alt=media')).json();
+    const after = await metadata(jsonFile.id);
+    if(before.version !== after.version) throw Error('Drive 목록이 변경됐습니다. 다시 시도해주세요.');
+    if(!fingerprint(data)) throw Error('올바른 watchparty 목록이 아닙니다.');
+    return {data,version:after.version};
+  }
+  async function adoptRemote(data,version) {
+    for(const video of data.videos) {
+      const cached = await imageStore('get',video.id);
+      if(cached && !cached.dirty && (!video.thumbnailFileId || cached.remoteId !== video.thumbnailFileId)) await imageStore('delete',video.id);
+    }
+    app.applyState(data); baseline = version; dirty = false; autoPaused = false;
+    for(const video of data.videos) if((await imageStore('get',video.id))?.dirty) dirty = true;
+  }
+  function mergedCatalog(local,remote) {
+    const categories = {...local.categories}, presets = structuredClone(local.presets), mapping = {};
+    for(const [key,name] of Object.entries(remote.categories)) {
+      let target = Object.keys(categories).find(k=>categories[k]===name);
+      if(!target) { target=key; while(Object.hasOwn(categories,target)) target='custom_'+crypto.randomUUID().replaceAll('-',''); categories[target]=name; }
+      mapping[key]=target;
+      presets[target]=[...new Set([...(presets[target]||[]),...(remote.presets[key]||[])])];
+    }
+    const ids = new Set(local.videos.map(v=>v.id));
+    const videos = [...local.videos,...remote.videos.filter(v=>!ids.has(v.id)).map(v=>({...v,category:mapping[v.category]||'unclassified'}))];
+    const combined = {version:2,categories,presets,streamers:[...new Set([...(local.streamers||[]),...(remote.streamers||[])])],videos};
+    if(!fingerprint(combined)) throw Error('합친 목록의 분류가 너무 많습니다. 목록을 따로 내보낸 뒤 정리해주세요.');
+    return combined;
+  }
+  function chooseLists() {
+    $('driveChoiceCount').textContent = '이 기기 '+app.getState().videos.length+'개 · Drive '+(candidate?.data.videos.length ?? '?')+'개';
+    $('driveChoiceError').textContent = '';
+    if(!$('driveChoice').open) $('driveChoice').showModal();
+  }
+  async function resolveLists(merge) {
+    if(busy) return;
+    await run(async()=>{
+      const remote = await readRemote();
+      const data = merge ? mergedCatalog(app.getState(),remote.data) : remote.data;
+      await adoptRemote(data,remote.version);
+      $('driveChoice').close();
+      if(merge) { dirty=false; await uploadState(); lastSaved=new Date(); }
+      status(merge ? '두 목록을 합쳐 Drive에 저장했습니다. 이제 편집하면 자동 저장됩니다.' : 'Drive 목록을 가져왔습니다. 이제 편집하면 자동 저장됩니다.');
+    });
   }
   function fingerprint(state) {
     if(state?.version !== 2 || !catalogValid(state.categories,state.presets) || !Array.isArray(state.videos) || !state.videos.every(valid)) return null;
@@ -94,7 +153,10 @@
   async function checkConflict() {
     if (jsonFile) {
       const latest = await metadata(jsonFile.id);
-      if (!baseline || latest.version !== baseline) { autoPaused = true; throw Error('Drive에 다른 변경 내용이 있어 자동 저장을 멈췄습니다. 먼저 불러오세요. 현재 기기 목록은 내보내기로 보관할 수 있습니다.'); }
+      if (!baseline || latest.version !== baseline) {
+        baseline=null; autoPaused=true; candidate=await readRemote();
+        throw Error('Drive에 다른 변경 내용이 있어 자동 저장을 멈췄습니다. 목록 선택하기에서 합치거나 Drive 목록을 가져오세요.');
+      }
     }
   }
   async function uploadState() {
@@ -124,14 +186,14 @@
   async function run(operation) {
     if (busy) return;
     busy = true; controls();
-    try { await operation(); } catch (error) { status(error.message || '연결에 실패했습니다.'); }
+    try { await operation(); } catch (error) { dirty=true; autoPaused=true; $('driveChoiceError').textContent=error.message; status(error.message || '연결에 실패했습니다.'); }
     finally { busy = false; controls(); if (canAutoSave()) schedule(); }
   }
   async function saveRemote() {
     await run(async () => {
       clearTimeout(timer); autoPaused = false;
       status('목록과 썸네일을 Drive에 저장 중…'); dirty = false;
-      try { await uploadState(); status('Drive에 저장했습니다. 다른 기기에서 같은 Google 계정으로 불러오세요.'); }
+      try { await uploadState(); lastSaved=new Date(); status('Drive에 저장했습니다. 다음 편집도 자동으로 저장됩니다.'); }
       catch (error) { dirty = true; autoPaused = true; throw error; }
     });
   }
@@ -139,18 +201,8 @@
     if (app.getState().videos.length && !confirm('현재 기기의 목록을 Drive 목록으로 바꿀까요? 보관할 내용이 있다면 먼저 목록 내보내기를 이용하세요.')) return;
     await run(async () => {
       status('Drive 목록을 불러오는 중…');
-      const before = await metadata(jsonFile.id);
-      const data = await (await api('files/' + encodeURIComponent(jsonFile.id) + '?alt=media')).json();
-      const after = await metadata(jsonFile.id);
-      if (before.version !== after.version) throw Error('목록이 변경됐습니다. 다시 불러오기를 눌러주세요.');
-      // Validate before changing any local thumbnail records.
-      if (data?.version !== 2 || !catalogValid(data.categories, data.presets) || !Array.isArray(data.videos) || !data.videos.every(valid)) throw Error('올바른 Watchparty 목록이 아닙니다.');
-      for (const video of data.videos) {
-        const cached = await imageStore('get', video.id);
-        if (cached && !cached.dirty && (!video.thumbnailFileId || cached.remoteId !== video.thumbnailFileId)) await imageStore('delete', video.id);
-      }
-      app.applyState(data); baseline = after.version; dirty = false; autoPaused = false;
-      for(const video of data.videos) if((await imageStore('get',video.id))?.dirty) dirty = true;
+      const remote = await readRemote();
+      await adoptRemote(remote.data,remote.version);
       status('Drive 목록을 불러왔습니다. 편집 내용은 자동 저장됩니다.');
     });
   }
@@ -160,31 +212,42 @@
   }
   function loadGIS() {
     if (window.google?.accounts?.oauth2) return Promise.resolve();
-    return new Promise((resolve, reject) => {
+    return gisPromise ||= new Promise((resolve, reject) => {
       const script = document.createElement('script'); script.src = 'https://accounts.google.com/gsi/client';
-      script.onload = resolve; script.onerror = () => { script.remove(); reject(Error('Google 로그인 스크립트를 불러올 수 없습니다. 인터넷 연결을 확인하세요.')); };
+      script.onload = resolve; script.onerror = () => { gisPromise=null; script.remove(); reject(Error('Google 로그인 스크립트를 불러올 수 없습니다. 인터넷 연결을 확인하세요.')); };
       document.head.append(script);
     });
+  }
+  async function prepareLogin() {
+    gisLoading=true; controls();
+    try { await loadGIS(); return true; } catch(e) { status(e.message); return false; }
+    finally { gisLoading=false; controls(); }
   }
   async function connect() {
     const clientId = localStorage.getItem('watchparty-google-client-id');
     if (!clientId) { openSettings(); return; }
     // Loading the library first can consume the browser's popup gesture: if so, ask for a second explicit click.
     if (!window.google?.accounts?.oauth2) {
-      try { status('Google 연결 준비 중…'); await loadGIS(); status('준비됐습니다. Google 연결을 한 번 더 눌러주세요.'); }
-      catch (e) { status(e.message); } return;
+      if(await prepareLogin()) status('로그인 준비가 됐습니다. Google 계정으로 연결을 눌러주세요.'); return;
     }
     const client = google.accounts.oauth2.initTokenClient({ client_id: clientId, scope: SCOPE, include_granted_scopes: false,
       error_callback: () => { status('로그인 창이 닫혔거나 차단됐습니다. Chrome에서 다시 연결해주세요.'); },
       callback: async result => {
         if (result.error || !result.access_token) { status('Google 연결을 승인하지 않았습니다.'); return; }
         token = result.access_token; expiry = Date.now() + Number(result.expires_in || 3600) * 1000 - 30000;
-        autoPaused = false;
+        autoPaused = false; lastSaved=null;
         await run(async () => {
           status('watchparty 저장 파일을 찾는 중…'); await discover();
-          status(jsonFile && !baseline ? 'Drive 목록과 현재 기기 목록이 다릅니다. 불러오기 후 편집하면 자동 저장됩니다.' : 'watchparty에 연결됐습니다. 편집 내용은 자동 저장됩니다.');
+          if(jsonFile && !baseline && !app.getState().videos.length) {
+            await adoptRemote(candidate.data,candidate.version);
+            status('Drive 목록을 자동으로 가져왔습니다. 편집 내용은 자동 저장됩니다.');
+          } else if(!jsonFile) {
+            dirty=false; await uploadState(); lastSaved=new Date();
+            status('watchparty에 연결하고 저장했습니다. 편집 내용은 자동 저장됩니다.');
+          } else status(!baseline ? '목록이 서로 다릅니다. 합치거나 Drive 목록을 선택해주세요.' : 'watchparty에 연결됐습니다. 편집 내용은 자동 저장됩니다.');
           app.render();
         });
+        if(jsonFile && !baseline && candidate) chooseLists();
       }
     }); client.requestAccessToken({ prompt: 'select_account' });
   }
@@ -196,9 +259,12 @@
     if (!/^[A-Za-z0-9_-]+\.apps\.googleusercontent\.com$/.test(id)) { $('driveConfigError').textContent = '올바른 웹 OAuth 클라이언트 ID를 입력해주세요.'; return; }
     try { localStorage.setItem('watchparty-google-client-id', id); } catch { $('driveConfigError').textContent = '이 브라우저에서 설정을 저장할 수 없습니다.'; return; }
     clearTimeout(timer); token = null; folder = null; thumbnailFolder = null; jsonFile = null; baseline = null; autoPaused = false; controls();
-    $('driveConfig').close(); status('설정을 저장했습니다. Google 연결을 눌러주세요.');
+    $('driveConfig').close(); status('설정을 저장했습니다. Google 계정으로 연결을 눌러주세요.'); prepareLogin();
   };
   $('driveConnect').onclick = connect; $('driveSave').onclick = saveRemote; $('driveLoad').onclick = loadRemote;
+  $('driveRetry').onclick = saveRemote; $('driveResolve').onclick = chooseLists;
+  $('driveMerge').onclick = () => resolveLists(true); $('driveUseRemote').onclick = () => resolveLists(false);
+  $('driveChoiceLater').onclick = () => $('driveChoice').close();
   $('driveDisconnect').onclick = () => {
     clearTimeout(timer); token = null; expiry = 0; folder = null; thumbnailFolder = null; jsonFile = null; baseline = null; autoPaused = false; controls();
     status('연결을 해제했습니다. 기기에 저장한 목록과 썸네일은 유지됩니다.');
@@ -239,4 +305,5 @@
     }
   };
   controls(); app.render();
+  if(localStorage.getItem('watchparty-google-client-id')) prepareLogin();
 })();
