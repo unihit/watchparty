@@ -61,7 +61,7 @@
     return json('files?uploadType=multipart&fields=id,version', { method: 'POST', body }, true);
   }
   async function ensureFolder() {
-    if (!folder) folder = (await json('files?fields=id', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Watchparty', mimeType: 'application/vnd.google-apps.folder', appProperties: { watchparty: 'folder-v1' } }) })).id;
+    if (!folder) folder = (await json('files?fields=id', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'watchparty', mimeType: 'application/vnd.google-apps.folder', appProperties: { watchparty: 'folder-v1' } }) })).id;
   }
   async function ensureThumbnailFolder() {
     if (!thumbnailFolder) {
@@ -165,8 +165,8 @@
         token = result.access_token; expiry = Date.now() + Number(result.expires_in || 3600) * 1000 - 30000;
         $('driveAuto').checked = false;
         await run(async () => {
-          status('Watchparty 저장 파일을 찾는 중…'); await discover();
-          status(jsonFile ? '저장된 Drive 목록이 있습니다. 불러오기를 눌러주세요.' : '연결됐습니다. Drive에 저장을 누르면 Watchparty 폴더를 만듭니다.');
+          status('watchparty 저장 파일을 찾는 중…'); await discover();
+          status(jsonFile ? '저장된 Drive 목록이 있습니다. 불러오기를 눌러주세요.' : '연결됐습니다. Drive에 저장을 누르면 watchparty 폴더를 만듭니다.');
           app.render();
         });
       }
