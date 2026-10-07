@@ -290,12 +290,36 @@
       }
     }); client.requestAccessToken({ prompt: 'select_account' });
   }
-  function openSettings() { $('clientId').value = localStorage.getItem('watchparty-google-client-id') || ''; $('driveConfigError').textContent = ''; $('driveConfig').showModal(); }
+  function openSettings() { $('clientId').value = localStorage.getItem('watchparty-google-client-id') || ''; $('driveConfigError').textContent = ''; $('driveConfigNotice').textContent = ''; $('driveConfigFile').value = ''; $('driveConfig').showModal(); }
+  const validClientId = id => typeof id==='string' && id.length<=300 && /^[A-Za-z0-9_-]+\.apps\.googleusercontent\.com$/.test(id);
+  $('driveConfigExport').onclick = () => {
+    const id=$('clientId').value.trim();
+    $('driveConfigError').textContent=''; $('driveConfigNotice').textContent='';
+    if(!validClientId(id)) { $('driveConfigError').textContent='다운로드할 올바른 클라이언트 ID를 입력해주세요.'; return; }
+    const data={format:'watchparty-connection-settings',version:1,googleClientId:id};
+    const url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));
+    const link=document.createElement('a');link.href=url;link.download='watchparty-connection-settings.json';
+    document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
+    $('driveConfigNotice').textContent='설정 파일을 다운로드했습니다. 로그인 토큰과 영상 목록은 포함하지 않습니다.';
+  };
+  $('driveConfigImport').onclick = () => $('driveConfigFile').click();
+  $('driveConfigFile').onchange = async () => {
+    const file=$('driveConfigFile').files?.[0];if(!file)return;
+    $('driveConfigError').textContent=''; $('driveConfigNotice').textContent='';
+    try {
+      if(file.size>10000)throw Error('10KB 이하의 watchparty 설정 JSON 파일을 선택해주세요.');
+      const data=JSON.parse(await file.text());
+      if(data?.format!=='watchparty-connection-settings' || data.version!==1 || !validClientId(data.googleClientId))throw Error('올바른 watchparty 연결 설정 파일이 아닙니다.');
+      $('clientId').value=data.googleClientId;
+      $('driveConfigNotice').textContent='설정 파일을 가져왔습니다. 설정 저장을 눌러 적용하세요.';
+    } catch(error) { $('driveConfigError').textContent=error instanceof SyntaxError?'JSON 파일을 읽을 수 없습니다.':error.message; }
+    finally { $('driveConfigFile').value=''; }
+  };
   $('driveSettings').onclick = openSettings;
   $('driveConfigClose').onclick = () => $('driveConfig').close();
   $('driveConfigForm').onsubmit = event => {
-    event.preventDefault(); const id = $('clientId').value.trim();
-    if (!/^[A-Za-z0-9_-]+\.apps\.googleusercontent\.com$/.test(id)) { $('driveConfigError').textContent = '올바른 웹 OAuth 클라이언트 ID를 입력해주세요.'; return; }
+    event.preventDefault(); if(busy){$('driveConfigError').textContent='동기화가 완료된 후 설정을 저장해주세요.';return;} const id = $('clientId').value.trim();
+    if (!validClientId(id)) { $('driveConfigError').textContent = '올바른 웹 OAuth 클라이언트 ID를 입력해주세요.'; return; }
     try { localStorage.setItem('watchparty-google-client-id', id); } catch { $('driveConfigError').textContent = '이 브라우저에서 설정을 저장할 수 없습니다.'; return; }
     clearTimeout(timer); clearSession(); folder = null; thumbnailFolder = null; jsonFile = null; baseline = null; autoPaused = false; controls();
     $('driveConfig').close(); status('설정을 저장했습니다. Google 계정으로 연결을 눌러주세요.'); prepareLogin();
