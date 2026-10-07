@@ -19,7 +19,7 @@
     install.disabled = prompting;
     installNow.hidden = !pending || installed || standalone();
     installNow.disabled = prompting;
-    status.textContent = navigator.onLine ? '이 기기에 저장되는 개인 목록' : '오프라인 · 목록과 메모를 볼 수 있습니다';
+    status.textContent = navigator.onLine ? '이 기기에 저장되는 개인 목록' : '오프라인 · 저장한 목록을 볼 수 있습니다';
   };
   refresh();
   addEventListener('online', refresh);
