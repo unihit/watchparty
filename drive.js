@@ -13,7 +13,7 @@
   // Short-lived credentials survive a reload in this tab, but are never stored in localStorage.
   const SESSION_KEY = 'watchparty-drive-session-v1';
   function clearSession() {
-    token=null; expiry=0;
+    token=null; expiry=0; clearRefresh();
     try { sessionStorage.removeItem(SESSION_KEY); } catch {}
   }
   function rememberSession(clientId) {
@@ -88,11 +88,14 @@
       transaction.onabort = () => reject(Error('썸네일 저장이 중단됐습니다.'));
     });
   }
-  async function api(path, options = {}, upload = false) {
-    if (!token || Date.now() >= expiry) { clearSession(); controls(); throw Error('Google 연결이 만료됐습니다. 다시 연결해주세요.'); }
+  async function api(path, options = {}, upload = false, retried = false) {
+    if (!token || Date.now() >= expiry - 60000) {
+      if (!(await refreshToken())) { clearSession(); throw Error('Google 연결이 만료됐습니다. Google 연결을 눌러 다시 승인해주세요.'); }
+    }
     const headers = new Headers(options.headers); headers.set('Authorization', 'Bearer ' + token);
     const response = await fetch('https://www.googleapis.com/' + (upload ? 'upload/drive/v3/' : 'drive/v3/') + path, { ...options, headers });
     if (!response.ok) {
+      if (response.status === 401 && !retried && await refreshToken()) return api(path, options, upload, true);
       if (response.status === 401) { clearSession(); controls(); }
       let message;
       try { message = (await response.json()).error?.message; } catch {}
@@ -367,6 +370,53 @@
     });
     if(!isReader() && jsonFile && !baseline && candidate) chooseLists();
   }
+  // One consent is enough: keep a grant marker and renew the short-lived access token silently.
+  const AUTO_KEY = 'watchparty-google-auto-v1';
+  let tokenClient = null, tokenWaiter = null, refreshTimer = null, autoTried = false;
+  const autoEnabled = () => { try { return localStorage.getItem(AUTO_KEY) === '1'; } catch { return false; } };
+  function clearRefresh() { clearTimeout(refreshTimer); refreshTimer = null; }
+  function settleToken(ok) {
+    const waiter = tokenWaiter; tokenWaiter = null;
+    if (waiter) { clearTimeout(waiter.timer); waiter.done(ok); }
+    controls();
+  }
+  function tokenRequest(prompt) {
+    const clientId = localStorage.getItem('watchparty-google-client-id');
+    if (!clientId || !window.google?.accounts?.oauth2) return Promise.resolve(false);
+    if (!tokenClient) {
+      tokenClient = google.accounts.oauth2.initTokenClient({ client_id: clientId, scope: SCOPE, include_granted_scopes: false,
+        error_callback: () => settleToken(false),
+        callback: result => {
+          if (result.error || !result.access_token) { settleToken(false); return; }
+          token = result.access_token; expiry = Date.now() + Number(result.expires_in || 3600) * 1000 - 30000;
+          rememberSession(clientId); scheduleRefresh(); settleToken(true);
+        }
+      });
+    }
+    if (tokenWaiter) return tokenWaiter.promise;
+    const waiter = { done: null, timer: null, promise: null };
+    waiter.promise = new Promise(resolve => { waiter.done = resolve; });
+    waiter.timer = setTimeout(() => settleToken(false), prompt === '' ? 15000 : 120000);
+    tokenWaiter = waiter;
+    try { tokenClient.requestAccessToken({ prompt }); }
+    catch { settleToken(false); }
+    return waiter.promise;
+  }
+  function scheduleRefresh() {
+    clearRefresh();
+    if (!token) return;
+    refreshTimer = setTimeout(() => { refreshToken(); }, Math.max(60000, expiry - Date.now() - 300000));
+  }
+  async function refreshToken() {
+    if (!token || !autoEnabled() || !window.google?.accounts?.oauth2) return false;
+    const ok = await tokenRequest('').catch(() => false);
+    return Boolean(ok && token && Date.now() < expiry);
+  }
+  async function autoReconnect() {
+    if (autoTried || token || !autoEnabled()) return;
+    autoTried = true;
+    if (await tokenRequest('').catch(() => false)) await initializeConnection();
+  }
   async function connect() {
     const clientId = localStorage.getItem('watchparty-google-client-id');
     if (!clientId) { openSettings(); return; }
@@ -374,15 +424,10 @@
     if (!window.google?.accounts?.oauth2) {
       if(await prepareLogin()) status('로그인 준비가 됐습니다. Google 계정으로 연결을 눌러주세요.'); return;
     }
-    const client = google.accounts.oauth2.initTokenClient({ client_id: clientId, scope: SCOPE, include_granted_scopes: false,
-      error_callback: () => { status('로그인 창이 닫혔거나 차단됐습니다. Chrome에서 다시 연결해주세요.'); },
-      callback: async result => {
-        if (result.error || !result.access_token) { status('Google 연결을 승인하지 않았습니다.'); return; }
-        token = result.access_token; expiry = Date.now() + Number(result.expires_in || 3600) * 1000 - 30000;
-        rememberSession(clientId);
-        await initializeConnection();
-      }
-    }); client.requestAccessToken({ prompt: 'select_account' });
+    const ok = await tokenRequest('select_account');
+    if (!ok) { status('Google 연결을 승인하지 않았습니다. 다시 시도해주세요.'); return; }
+    try { localStorage.setItem(AUTO_KEY,'1'); } catch {}
+    await initializeConnection();
   }
   function openSettings() { $('clientId').value = localStorage.getItem('watchparty-google-client-id') || ''; $('driveConfigError').textContent = ''; $('driveConfigNotice').textContent = ''; $('driveConfigFile').value = ''; $('driveConfig').showModal(); }
   const validClientId = id => typeof id==='string' && id.length<=300 && /^[A-Za-z0-9_-]+\.apps\.googleusercontent\.com$/.test(id);
@@ -415,6 +460,7 @@
     event.preventDefault(); if(busy){$('driveConfigError').textContent='동기화가 완료된 후 설정을 저장해주세요.';return;} const id = $('clientId').value.trim();
     if (!validClientId(id)) { $('driveConfigError').textContent = '올바른 웹 OAuth 클라이언트 ID를 입력해주세요.'; return; }
     try { localStorage.setItem('watchparty-google-client-id', id); } catch { $('driveConfigError').textContent = '이 브라우저에서 설정을 저장할 수 없습니다.'; return; }
+    tokenClient = null;
     clearTimeout(timer); clearSession(); folder = null; thumbnailFolder = null; jsonFile = null; baseline = null; autoPaused = false; controls();
     $('driveConfig').close(); status('설정을 저장했습니다. Google 계정으로 연결을 눌러주세요.'); prepareLogin();
   };
@@ -468,7 +514,8 @@
     else syncLatest();
   });
   $('driveDisconnect').onclick = () => {
-    clearTimeout(timer); clearSession(); folder = null; thumbnailFolder = null; jsonFile = null; baseline = null; autoPaused = false; controls();
+    clearTimeout(timer); clearSession(); try { localStorage.removeItem(AUTO_KEY); } catch {}
+    folder = null; thumbnailFolder = null; jsonFile = null; baseline = null; autoPaused = false; controls();
     status('연결을 해제했습니다.');
   };
   window.WatchpartyDrive = {
@@ -511,6 +558,6 @@
     }
   };
   controls(); app.render();
-  if(restoreSession()) initializeConnection();
-  if(localStorage.getItem('watchparty-google-client-id')) prepareLogin();
+  if(restoreSession()) { try { localStorage.setItem(AUTO_KEY,'1'); } catch {} scheduleRefresh(); initializeConnection(); }
+  if(localStorage.getItem('watchparty-google-client-id')) prepareLogin().then(() => { if(!token) autoReconnect(); });
 })();
