@@ -58,13 +58,14 @@
     $('driveDisconnect').hidden = !token;
     $('driveFolderLink').hidden = !folder || reader;
     if(folder) $('driveFolderLink').href = 'https://drive.google.com/drive/folders/' + folder;
-    $('driveConnect').textContent = gisLoading ? '로그인 준비 중…' : 'Google 계정으로 연결';
+    $('driveConnect').textContent = gisLoading ? '로그인 준비 중…' : 'Google 연결';
     $('driveTitle').textContent = reader ? 'Drive에서 가져오기' : token ? 'Drive 동기화' : '기기 간 동기화';
     $('driveBadge').textContent = busy ? (reader ? '가져오는 중…' : '동기화 중…') : !token ? '이 기기에 보관 중' : reader ? '조회 전용' : needsChoice ? '목록 선택 필요' : autoPaused ? '저장 확인 필요' : dirty ? '저장 대기 중' : '자동 저장 켜짐';
     $('driveBadge').className = 'sync-badge ' + (busy ? 'working' : !token ? 'local' : reader ? 'local' : needsChoice || autoPaused ? 'paused' : dirty ? 'working' : 'saved');
-    $('driveRoleLabel').textContent = reader ? '이 기기 · 조회 전용' : '이 기기 · 등록 기기';
-    $('driveRoleToggle').textContent = reader ? '등록 기기로 사용' : '조회 전용으로 바꾸기';
-    $('driveRoleToggle').disabled = busy;
+    $('driveRoleSwitch').checked = !reader;
+    $('driveRoleSwitch').disabled = busy;
+    $('driveRoleName').textContent = reader ? '조회 전용' : '등록 기기';
+    $('driveRoleNote').textContent = reader ? '눌러서 등록 기기로 변경' : '눌러서 조회 전용으로 변경';
     $('driveLastSaved').hidden = !token || !lastSaved;
     if(lastSaved) $('driveLastSaved').textContent = '마지막 동기화 · ' + lastSaved.toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'});
   };
@@ -193,6 +194,59 @@
     } while(page);
   }
   const metadata = id => json('files/' + encodeURIComponent(id) + '?fields=id,version');
+  // Single-writer claim: the folder keeps device.json so only one device can be the writer.
+  const DEVICE_KEY = 'watchparty-device-id-v1', DEVICE_NAME_KEY = 'watchparty-device-name-v1', CLAIM_INTENT_KEY = 'watchparty-claim-intent-v1';
+  let claimFile = null, claim = null;
+  function deviceId() {
+    try { let id = localStorage.getItem(DEVICE_KEY); if (!id) { id = crypto.randomUUID(); localStorage.setItem(DEVICE_KEY, id); } return id; }
+    catch { return 'unknown-device'; }
+  }
+  function defaultDeviceName() {
+    const ua = navigator.userAgent || '';
+    const os = /Android/i.test(ua) ? 'Android' : /iPhone|iPad|iPod/.test(ua) ? 'iOS' : /Windows/i.test(ua) ? 'Windows' : /Macintosh|Mac OS X/.test(ua) ? 'Mac' : /Linux/i.test(ua) ? 'Linux' : '기타';
+    const browser = /Edg\//.test(ua) ? 'Edge' : /OPR\//.test(ua) ? 'Opera' : /Chrome\//.test(ua) ? 'Chrome' : /Firefox\//.test(ua) ? 'Firefox' : /Safari\//.test(ua) ? 'Safari' : '브라우저';
+    return os + ' · ' + browser;
+  }
+  function deviceName() { try { return localStorage.getItem(DEVICE_NAME_KEY) || defaultDeviceName(); } catch { return '이 기기'; } }
+  const claimIntent = () => { try { return localStorage.getItem(CLAIM_INTENT_KEY) === '1'; } catch { return false; } };
+  function setClaimIntent(on) { try { on ? localStorage.setItem(CLAIM_INTENT_KEY, '1') : localStorage.removeItem(CLAIM_INTENT_KEY); } catch {} }
+  async function findClaim() {
+    claimFile = null; claim = null;
+    if (!folder) return null;
+    const found = await json(query("trashed = false and '" + folder + "' in parents and appProperties has { key='watchparty' and value='device-v1' }"));
+    claimFile = found.files[0] || null;
+    if (!claimFile) return null;
+    try {
+      const data = await (await api('files/' + encodeURIComponent(claimFile.id) + '?alt=media')).json();
+      if (data?.version === 1 && typeof data.writerId === 'string' && typeof data.writerName === 'string' && data.writerName.length <= 60) claim = data;
+    } catch { claim = null; }
+    return claim;
+  }
+  async function writeClaim() {
+    const data = { version: 1, writerId: deviceId(), writerName: deviceName(), claimedAt: new Date().toISOString() };
+    const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
+    if (claimFile) await json('files/' + encodeURIComponent(claimFile.id) + '?uploadType=media&fields=id,version', { method: 'PATCH', body: blob }, true);
+    else claimFile = await multipart({ name: 'device.json', parents: [folder], appProperties: { watchparty: 'device-v1' } }, blob);
+    claim = data; setClaimIntent(false);
+    return data;
+  }
+  function demote(message) {
+    setRole('reader');
+    try { document.body.dataset.role = 'reader'; } catch {}
+    dirty = false; autoPaused = false;
+    status(message);
+  }
+  async function ensureClaim() {
+    await ensureFolder();
+    const current = await findClaim();
+    if (claimIntent()) { await writeClaim(); return; }
+    if (current && current.writerId !== deviceId()) {
+      const message = "다른 기기('" + current.writerName + "')가 등록 기기로 설정되어 이 기기를 조회 전용으로 바꿨습니다. 이 기기에서 등록하려면 역할을 다시 바꿔주세요.";
+      demote(message);
+      throw Error(message);
+    }
+    if (!current) await writeClaim();
+  }
   async function checkConflict() {
     if (jsonFile) {
       const latest = await metadata(jsonFile.id);
@@ -204,7 +258,7 @@
   }
   async function uploadState() {
     if (isReader()) throw Error('이 기기는 조회 전용입니다. 영상 등록과 수정은 등록 기기에서만 할 수 있습니다.');
-    await checkConflict(); await ensureFolder(); await ensureThumbnailFolder();
+    await ensureClaim(); await checkConflict(); await ensureThumbnailFolder();
     const snapshot = app.getState();
     const uploaded = [];
     for (const video of snapshot.videos) {
@@ -297,6 +351,11 @@
         status('Drive 목록을 가져왔습니다. 이 기기는 조회 전용이며 등록·수정은 등록 기기에서만 됩니다.' + (backedUp ? ' 이 기기에 있던 목록은 따로 백업했습니다.' : ''));
         app.render(); return;
       }
+      try { await ensureClaim(); }
+      catch (error) {
+        if (isReader() && candidate) { try { await adoptRemote(candidate.data, candidate.version); } catch {} }
+        status(error.message); app.render(); return;
+      }
       if(jsonFile && !baseline && (canAdoptCandidate || (!app.getState().videos.length && !dirty))) {
         await adoptRemote(candidate.data,candidate.version);
         status('Drive 목록을 자동으로 가져왔습니다. 편집 내용은 자동 저장됩니다.');
@@ -361,12 +420,26 @@
   };
   $('driveConnect').onclick = connect; $('driveSave').onclick = saveRemote; $('driveLoad').onclick = loadRemote;
   $('driveRetry').onclick = saveRemote; $('driveResolve').onclick = chooseLists;
-  $('driveRoleToggle').onclick = () => {
-    if (busy) return;
-    const toWriter = isReader();
-    if (toWriter && !confirm('이 기기를 등록 기기로 바꿀까요?\n\n이 기기에서 영상과 썸네일을 추가·수정하고 Drive에 저장할 수 있게 됩니다. 등록 기기는 한 대만 두는 것을 권장합니다.')) return;
-    if (!toWriter && !confirm('이 기기를 조회 전용으로 바꿀까요?\n\n이 기기에서는 영상 등록·수정·자동 저장이 중지되고 Drive 목록만 가져옵니다.')) return;
-    setRole(toWriter ? 'writer' : 'reader');
+  $('driveRoleSwitch').onchange = async event => {
+    const input = event.target;
+    if (busy) { input.checked = !input.checked; return; }
+    if (input.checked) {
+      if (!confirm('이 기기를 등록 기기로 바꿀까요?\n\n이 기기에서 영상과 썸네일을 추가·수정해 Drive에 저장합니다. 등록 기기는 한 대만 사용할 수 있습니다.')) { input.checked = false; return; }
+      if (token && folder) {
+        try {
+          const existing = await findClaim();
+          if (existing && existing.writerId !== deviceId()) {
+            if (!confirm("이미 '" + existing.writerName + "' 기기가 등록 기기입니다.\n\n그래도 이 기기를 등록 기기로 바꿀까요? 기존 등록 기기는 자동으로 조회 전용이 됩니다.")) { input.checked = false; return; }
+          }
+          setClaimIntent(true);
+        } catch { /* 확인하지 못하면 연결할 때 판단합니다. */ }
+      }
+      setRole('writer');
+    } else {
+      if (!confirm('이 기기를 조회 전용으로 바꿀까요?\n\n영상 등록·수정·자동 저장이 중지되고 Drive 목록만 가져옵니다.')) { input.checked = true; return; }
+      setClaimIntent(false);
+      setRole('reader');
+    }
     location.reload();
   };
   $('driveMerge').onclick = () => resolveLists(true); $('driveUseRemote').onclick = () => resolveLists(false);
@@ -438,6 +511,7 @@
     }
   };
   controls(); app.render();
+  if(isReader() && !token) $('driveStatus').textContent = 'Google 계정을 연결하면 등록 기기의 목록을 자동으로 가져옵니다.';
   if(restoreSession()) initializeConnection();
   if(localStorage.getItem('watchparty-google-client-id')) prepareLogin();
 })();
